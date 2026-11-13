@@ -1,0 +1,11 @@
+# Los escaneos y todo lo que generan las herramientas son privados: nunca al repositorio.
+*.db
+*.npz
+*.ply
+*.png
+*.jpg
+*.jpeg
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
