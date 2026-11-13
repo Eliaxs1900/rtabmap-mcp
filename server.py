@@ -27,7 +27,15 @@ Format notes (learned the hard way):
     local_transform, then K/D/R/P as float64 and local_transform as float32.
     Depth is lower resolution than RGB: scale K by depth_w / rgb_w.
   * Node.pose is a row-major 3x4 float32 (world <- base); the camera's
-    local_transform maps optical frame -> base.
+    local_transform maps optical frame -> base. Node.pose is raw odometry.
+  * Admin.opt_ids / opt_poses hold the poses of the optimized graph (loop
+    closures applied), saved when the map was closed. Both use RTAB-Map's
+    compressData2(): a zlib stream followed by int32 rows, cols, OpenCV type.
+    Nodes with weight -9 were dropped from the graph (e.g. the camera did not
+    move) and are not in opt_ids. In the two test scans the optimized poses
+    move frames 1-3.5 cm and 0.1-0.3 degrees away from odometry.
+  * Data.depth_confidence: compressData2 uint8 at depth resolution, ARKit
+    confidence stored as 0 / 50 / 100 (low / medium / high).
 """
 from __future__ import annotations
 
@@ -138,6 +146,53 @@ def _pose(blob: bytes | None) -> np.ndarray | None:
         return None
     T = np.frombuffer(blob, "<f4", 12).reshape(3, 4).astype(np.float64)
     return T if T.any() else None
+
+
+def _unpack_mat(blob: bytes, dtype) -> tuple[np.ndarray, int, int]:
+    """RTAB-Map compressData2(): zlib stream followed by int32 rows, cols, OpenCV type."""
+    if not blob or len(blob) < 13:
+        raise ValueError("bloque comprimido vacío")
+    rows, cols, _ = struct.unpack_from("<3i", blob, len(blob) - 12)
+    return np.frombuffer(zlib.decompress(blob[:-12]), dtype), rows, cols
+
+
+def _optimized_poses(con: sqlite3.Connection) -> dict[int, np.ndarray] | None:
+    """Admin.opt_ids / opt_poses: the poses of RTAB-Map's optimized graph (loop closures
+    applied) saved when the map was closed. None if the database has none."""
+    try:
+        row = con.execute("select opt_ids, opt_poses from Admin").fetchone()
+        ids, P = _unpack_mat(row[0], "<i4")[0], _unpack_mat(row[1], "<f4")[0]
+    except (sqlite3.Error, TypeError, ValueError, zlib.error, struct.error):
+        return None
+    if not len(ids) or len(P) != 12 * len(ids):
+        return None
+    P = P.reshape(-1, 3, 4).astype(np.float64)
+    return {int(i): P[k] for k, i in enumerate(ids)}
+
+
+CONFIDENCE = {"low": 0, "medium": 1, "high": 2}
+
+
+def _confidence(blob: bytes | None) -> np.ndarray | None:
+    """Data.depth_confidence as ARKit levels 0 low / 1 medium / 2 high; None if missing."""
+    try:
+        a, rows, cols = _unpack_mat(blob, np.uint8)
+    except (TypeError, ValueError, zlib.error, struct.error):
+        return None
+    if rows * cols != a.size:
+        return None
+    a = a.reshape(rows, cols)
+    return a // 50 if a.max() > 2 else a  # the iOS app stores 0 / 50 / 100
+
+
+def _ranges(ids) -> str:
+    """[1, 2, 3, 7, 9, 10] -> '1..3, 7, 9..10'."""
+    ids, out, i = sorted(ids), [], 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1: j += 1
+        out.append(f"{ids[i]}..{ids[j]}" if j > i else str(ids[i])); i = j + 1
+    return ", ".join(out)
 
 
 def _frame_points(depth_blob, calib_blob, T, dmin, dmax, step):
@@ -307,7 +362,26 @@ def rtabmap_info(db_path: str) -> str:
             out["trajectory_m"] = round(float(np.linalg.norm(np.diff(T, axis=0), axis=1).sum()), 2)
             out["camera_extent"] = {"min": T.min(0).round(2).tolist(), "max": T.max(0).round(2).tolist()}
         ids = [r[0] for r in con.execute("select id from Data where depth is not null order by id")]
-    out["frame_ids"] = f"{ids[0]}..{ids[-1]}" if ids else None
+        out["frame_ids"] = _ranges(ids) if ids else None
+        out["sessions"] = con.execute("select count(distinct map_id) from Node").fetchone()[0]
+        opt = _optimized_poses(con)
+        out["optimized_poses"] = len(opt) if opt else None
+        if opt:
+            outside = sorted(set(ids) - set(opt))
+            out["frames_outside_graph"] = _ranges(outside) if outside else None
+        try:
+            links = dict(con.execute("select type, count(*) from Link group by type").fetchall())
+            out["loop_closures"] = int(sum(links.get(t, 0) for t in (1, 2, 3, 4)))
+        except sqlite3.Error:
+            pass
+        if "depth_confidence" in {r[1] for r in con.execute("pragma table_info(Data)")}:
+            lv = np.zeros(3, np.int64)
+            for (b,) in con.execute("select depth_confidence from Data where depth is not null"):
+                c = _confidence(b)
+                if c is not None:
+                    lv += np.bincount(c.ravel(), minlength=3)[:3]
+            if lv.sum():
+                out["depth_confidence_pct"] = {k: round(100 * float(n) / lv.sum(), 1) for k, n in zip(CONFIDENCE, lv)}
     return json.dumps(out, indent=2, ensure_ascii=False)
 
 
@@ -341,24 +415,48 @@ def rtabmap_get_frame(db_path: str, frame_id: int, out_dir: str) -> str:
 def rtabmap_build_cloud(db_path: str, out_path: str, voxel_size: float = 0.01,
                         min_depth: float = 0.2, max_depth: float = 3.5, pixel_step: int = 1,
                         level_floor: bool = True, align_walls: bool = True,
-                        colors: bool = True, write_ply: bool = True) -> str:
+                        colors: bool = True, write_ply: bool = True,
+                        poses: str = "optimized", min_confidence: str = "low") -> str:
     """Fuse every depth frame into one world-space cloud.
     - voxel_size: downsampling in metres (0 = keep all points).
     - level_floor: fit the floor and move it to z=0 (z up).
     - align_walls: rotate about z so the dominant walls are parallel to X/Y.
     - colors: sample RGB from the JPEG frames.
+    - poses: 'optimized' = RTAB-Map's graph with loop closures (frames it dropped
+      are skipped); 'odometry' = raw per-frame poses of every frame (clouds built
+      before 2026-11-13 used these).
+    - min_confidence: drop LiDAR pixels below this ARKit confidence (low/medium/high).
     Writes <out_path>.npz (points, colors, transform) and optionally <out_path>.ply.
     Use the .npz with the other tools."""
     if voxel_size < 0 or pixel_step < 1 or not 0 <= min_depth < max_depth:
         raise ValueError("Valores fuera de rango: voxel_size >= 0, pixel_step >= 1 y 0 <= min_depth < max_depth.")
+    if poses not in ("optimized", "odometry"):
+        raise ValueError("poses tiene que ser 'optimized' u 'odometry'.")
+    if min_confidence not in CONFIDENCE:
+        raise ValueError("min_confidence tiene que ser 'low', 'medium' o 'high'.")
     out = _out_base(out_path, ".npz", ".ply")
     out.parent.mkdir(parents=True, exist_ok=True)
+    thr = CONFIDENCE[min_confidence]
     with closing(_db(db_path)) as con:
-        poses = {i: T for i, T in ((i, _pose(p)) for i, p in con.execute("select id, pose from Node")) if T is not None}
-        Ps, Cs, used, total, kept = [], [], 0, 0, 0
-        for fid, img, depth, cal in con.execute("select id, image, depth, calibration from Data where depth is not null order by id"):
-            if fid not in poses: continue
-            P, (u, v, (h, w)) = _frame_points(depth, cal, poses[fid], min_depth, max_depth, pixel_step)
+        pose_of, source = (_optimized_poses(con) if poses == "optimized" else None), "optimized"
+        if not pose_of:
+            source = "odometry" if poses == "odometry" else "odometry (la base no guarda poses optimizadas)"
+            pose_of = {i: T for i, T in ((i, _pose(p)) for i, p in con.execute("select id, pose from Node")) if T is not None}
+        sessions = con.execute("select count(distinct map_id) from Node").fetchone()[0]
+        has_conf = "depth_confidence" in {r[1] for r in con.execute("pragma table_info(Data)")}
+        conf_col = "depth_confidence" if thr and has_conf else "null"
+        Ps, Cs, used, total, kept, skipped, unfiltered = [], [], 0, 0, 0, [], 0
+        for fid, img, depth, cal, conf in con.execute(
+                f"select id, image, depth, calibration, {conf_col} from Data where depth is not null order by id"):
+            if fid not in pose_of:
+                skipped.append(fid); continue
+            P, (u, v, (h, w)) = _frame_points(depth, cal, pose_of[fid], min_depth, max_depth, pixel_step)
+            if thr:
+                cf = _confidence(conf)
+                if cf is not None and cf.shape == (h, w):
+                    keep = cf[v, u] >= thr; P, u, v = P[keep], u[keep], v[keep]
+                else:
+                    unfiltered += 1
             if colors:
                 if img:
                     I = np.asarray(Image.open(io.BytesIO(img)).convert("RGB"))
@@ -381,13 +479,21 @@ def rtabmap_build_cloud(db_path: str, out_path: str, voxel_size: float = 0.01,
     C = np.concatenate(Cs) if Cs else None
     if voxel_size > 0:
         r = _voxel(P, voxel_size, *([C] if C is not None else [])); P = r[0]; C = r[1] if C is not None else None
-    info = {"frames_used": used}
+    info = {"frames_used": used, "poses": source}
+    if skipped:
+        why = "fuera del grafo optimizado (RTAB-Map las descartó)" if source == "optimized" else "sin pose"
+        info["frames_skipped"] = f"{len(skipped)}: {_ranges(skipped)} ({why})"
+    if thr:
+        info["min_confidence"] = min_confidence
+        if unfiltered: info["frames_without_confidence"] = unfiltered
+    if source != "optimized" and sessions > 1:
+        info["warning"] = f"{sessions} sesiones (map_id): con poses de odometría no quedan alineadas entre sí."
     M = np.eye(4)
     if level_floor:
         P, M, li = _level_and_align(P, align_walls); info.update(li)
     np.savez_compressed(f"{out}.npz", points=P.astype(np.float32),
                         **({"colors": C.astype(np.uint8)} if C is not None else {}),
-                        transform=M, source=str(Path(db_path).expanduser()))
+                        transform=M, source=str(Path(db_path).expanduser()), poses=source)
     info["npz"] = f"{out}.npz"
     if write_ply:
         _write_ply(Path(f"{out}.ply"), P, C); info["ply"] = f"{out}.ply"
